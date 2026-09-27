@@ -1391,6 +1391,32 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("keeps absolute Windows working directories", { skip: process.platform !== "win32" }, () => {
+    const cwd = "D:/01_dev/25_las";
+    assert.equal(
+      testApi.resolveSubagentPaths({ agent: "scout", task: "smoke", cwd }, null).effectiveCwd,
+      cwd,
+    );
+  });
+
+  it("discovers CRLF agent definitions", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeFileSync(
+        join(projectAgentsDir, "crlf-agent.md"),
+        "---\r\nname: crlf-agent\r\ndescription: CRLF test\r\n---\r\n\r\nCRLF body\r\n",
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      assert.ok(tool, "expected subagents_list to be registered");
+      const result = await tool.execute();
+      assert.ok(result.details?.agents?.some((agent: any) => agent.name === "crlf-agent"));
+      assert.equal(testApi.loadAgentDefaults("crlf-agent")?.body, "CRLF body");
+    });
+  });
+
   it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(

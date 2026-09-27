@@ -29,7 +29,9 @@ function hasCommand(command: string): boolean {
 
   let available = false;
   try {
-    execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
+    // Probe tmux directly: PowerShell launches on Windows may have tmux on PATH
+    // without having Git Bash's sh.exe on PATH.
+    execFileSync(command, ["-V"], { stdio: "ignore" });
     available = true;
   } catch {
     available = false;
@@ -61,6 +63,34 @@ function requireTmux(): void {
   }
 }
 
+let paneTitleBarsConfigured = false;
+
+/**
+ * Show each pane's title in a thin border bar so subagent panes are easy to
+ * tell apart without colour. psmux stores these as global options, so this is
+ * applied once per process and kept muted (plain title text, default border).
+ * Best-effort: if it fails, the -T title is still set on the pane.
+ */
+function ensurePaneTitleBars(): void {
+  if (paneTitleBarsConfigured) return;
+  paneTitleBarsConfigured = true;
+  try {
+    execFileSync("tmux", ["set-option", "-g", "pane-border-status", "top"], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    // psmux renders the border label via plain string replace of
+    // #{pane_title}/#{pane_index}/#P only — inline #[fg=...] styles are NOT
+    // parsed and would render as literal text. Keep the format plain.
+    execFileSync("tmux", ["set-option", "-g", "pane-border-format", " #{pane_title} "], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+  } catch {
+    // Best effort; the per-pane title remains set regardless.
+  }
+}
+
 // ── Shell helpers ──
 
 export function shellEscape(s: string): string {
@@ -71,10 +101,10 @@ export function shellEscape(s: string): string {
 
 /**
  * tmux layout applied to the subagent window to keep panes evenly sized.
- * Switchable: "even-horizontal" (equal columns, matches Ctrl+b Alt+1),
- * "main-vertical" (big main pane + tiled column), "tiled" (grid).
+ * Switchable: "even-horizontal" (equal columns), "main-vertical" (big main
+ * pane + tiled column), "tiled" (grid: rows + columns).
  */
-const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+const SUBAGENT_TMUX_LAYOUT = "tiled";
 
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -114,7 +144,7 @@ function rebalanceSurfaces(hintPane?: string): void {
  * Returns the new pane id (e.g. `%12`).
  */
 export function createSurface(name: string): string {
-  void name; // tmux panes are not named; the pi process inside shows its own title.
+  void name; // pane title is set by createSurfaceSplit (locked via -T).
   return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
 }
 
@@ -127,7 +157,6 @@ export function createSurfaceSplit(
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  void name;
   requireTmux();
 
   const args = ["split-window", "-d"];
@@ -142,15 +171,82 @@ export function createSurfaceSplit(
   if (fromSurface) {
     args.push("-t", fromSurface);
   }
+  // Distinguish subagent panes by a locked title (the child pi's own OSC
+  // title cannot overwrite a title set with -T). Kept as plain text so the
+  // label stays muted, not a bright per-pane colour.
+  const title = (name ?? "")
+    .replace(/[\r\n\x00-\x1f]/g, "")
+    .trim()
+    .slice(0, 40) || "subagent";
+  args.push("-T", title);
+  ensurePaneTitleBars();
+  if (process.platform === "win32") {
+    // psmux 3.3.8 auto-appends `-c <cwd>` to every CLI split-window and, on
+    // the warm-pane transplant path, re-homes the pane with PowerShell syntax
+    // injected into a Git Bash shell (rehome_command picks by cfg!(windows)).
+    // The syntax error cycle races with the launch command and eats its first
+    // byte (`bash` -> `ash`). A non-empty -e bypasses the warm transplant
+    // (pane.rs gates it on extra_env.is_empty()), forcing the cold-spawn path
+    // which sets the pane cwd directly without any rehome.
+    args.push("-e", "PI_SUBAGENT_COLD_START=1");
+  }
   args.push("-P", "-F", "#{pane_id}");
 
-  const pane = execFileSync("tmux", args, { encoding: "utf8" }).trim();
-  if (!pane.startsWith("%")) {
-    throw new Error(`Unexpected tmux split-window output: ${pane}`);
+  // Rebalance the target's window BEFORE splitting. psmux halves the target
+  // pane on every split; a burst of parallel launches can shrink the parent
+  // below MIN_SPLIT_COLS (21) so the next split fails silently and returns
+  // the target id. Equalising first widens the target so splits keep
+  // succeeding. Cosmetic on failure.
+  if (fromSurface) {
+    try {
+      execFileSync("tmux", ["select-layout", "-t", fromSurface, SUBAGENT_TMUX_LAYOUT], {
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+    } catch {
+      // best effort
+    }
   }
 
-  rebalanceSurfaces(pane);
-  return pane;
+  // psmux SplitWindowPrint swallows split failures and expands #{pane_id}
+  // against the still-active OLD pane, so a failed split "succeeds" returning
+  // the TARGET id. Accept only a fresh, live, different pane; retry transient
+  // failures a bounded number of times.
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let pane = "";
+    try {
+      pane = execFileSync("tmux", args, { encoding: "utf8", timeout: 15_000 }).trim();
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+    if (pane.startsWith("%") && pane !== fromSurface) {
+      try {
+        const live = execFileSync("tmux", ["list-panes", "-a", "-F", "#{pane_id}"], {
+          encoding: "utf8",
+          timeout: 10_000,
+        });
+        if (live.split(/\r?\n/).includes(pane)) {
+          rebalanceSurfaces(pane);
+          return pane;
+        }
+        lastError = new Error(`tmux split-window returned ${pane} but no such pane exists`);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+      }
+    } else {
+      lastError = new Error(
+        pane === fromSurface
+          ? `tmux split-window returned the target pane id (${pane}) instead of a new pane`
+          : `Unexpected tmux split-window output: ${pane || "<empty>"}`,
+      );
+    }
+    if (attempt < 3) {
+      // psmux errors under load are transient; back off before retrying.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400 * attempt);
+    }
+  }
+  throw new Error(`${lastError?.message ?? "tmux split-window failed"} (3 attempts). Aborting launch.`);
 }
 
 /**
@@ -198,7 +294,10 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  // Pad with leading spaces so a dropped first byte in the terminal transport
+  // (observed as `bash` -> `ash`) consumes whitespace, never a command byte.
+  // Bash ignores leading whitespace before a command.
+  sendCommand(surface, `   bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 

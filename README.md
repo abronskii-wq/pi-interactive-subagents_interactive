@@ -116,6 +116,7 @@ You are a specialized agent that does X...
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `cwd` | string | Default working directory |
+| `color` | string | Pane title marker color: `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `brown`, `black`, `white`, or a raw emoji. Panes are labeled `<marker> <agent> #<n> · <job name>`; psmux cannot tint pane borders per pane, so the text marker is how agent types are told apart. Default: white circle |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
 

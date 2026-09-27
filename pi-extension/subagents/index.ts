@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -134,6 +134,13 @@ interface AgentDefaults {
   sessionMode?: SubagentSessionMode;
   cwd?: string;
   cli?: string;
+  /**
+   * Pane identity color: a name (red/orange/yellow/green/blue/purple/brown/
+   * black/white) or a raw emoji. Rendered as the marker prefix of the
+   * subagent's pane title. psmux cannot tint pane borders per pane, so this
+   * text marker is how agent types are told apart.
+   */
+  color?: string;
   body?: string;
   disableModelInvocation?: boolean;
 }
@@ -272,11 +279,13 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  // Git for Windows may check out bundled agent definitions with CRLF endings.
+  const normalized = content.replace(/\r\n/g, "\n");
+  const match = normalized.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
 
   const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const body = normalized.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
@@ -297,6 +306,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
+    color: getFrontmatterValue(frontmatter, "color"),
     cli: getFrontmatterValue(frontmatter, "cli"),
     body: body || undefined,
     disableModelInvocation:
@@ -338,7 +348,7 @@ function resolveSubagentPaths(
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
   const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
+    ? isAbsolute(rawCwd)
       ? rawCwd
       : join(cwdBase, rawCwd)
     : null;
@@ -399,6 +409,43 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
+}
+
+// ── Pane identity markers ──
+// psmux cannot color individual pane borders (select-pane -P is stored but
+// not rendered; pane-border-style is window-global), so subagent panes are
+// told apart by a text label: a color emoji per agent type (from the agent's
+// `color` frontmatter) + agent name + per-process spawn ordinal + job name.
+const AGENT_COLOR_MARKERS: Record<string, string> = {
+  red: "\u{1F534}",
+  orange: "\u{1F7E0}",
+  yellow: "\u{1F7E1}",
+  green: "\u{1F7E2}",
+  blue: "\u{1F535}",
+  purple: "\u{1F7E3}",
+  brown: "\u{1F7E4}",
+  black: "\u{26AB}",
+  white: "\u{26AA}",
+};
+
+let paneSpawnCounter = 0;
+
+function agentColorMarker(color: string | null | undefined): string {
+  if (!color) return "\u{26AA}"; // white circle: no color configured
+  const trimmed = color.trim();
+  return AGENT_COLOR_MARKERS[trimmed.toLowerCase()] ?? trimmed;
+}
+
+function buildPaneTitle(
+  agentName: string | null | undefined,
+  color: string | null | undefined,
+  jobName: string | null | undefined,
+): string {
+  paneSpawnCounter += 1;
+  const agent = agentName?.trim() || "subagent";
+  const job = jobName?.trim() ?? "";
+  const prefix = `${agentColorMarker(color)} ${agent} #${paneSpawnCounter}`;
+  return job && job !== agent ? `${prefix} · ${job}` : prefix;
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -1125,6 +1172,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  resolveSubagentPaths,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
@@ -1204,7 +1252,8 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const surface =
+    options?.surface ?? createSurface(buildPaneTitle(params.agent, agentDefs?.color, params.name));
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -2149,7 +2198,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
+        const resumeAgent = loadout.agent;
+        const resumeColor = resumeAgent ? loadAgentDefaults(resumeAgent)?.color : undefined;
+        const surface = createSurface(buildPaneTitle(resumeAgent, resumeColor, name));
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
