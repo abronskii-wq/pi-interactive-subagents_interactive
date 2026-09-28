@@ -12,7 +12,7 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -250,12 +250,51 @@ export function createSurfaceSplit(
 }
 
 /**
+ * Verify that a pane target resolves to ITSELF. psmux 3.3.8 resolves `%N`
+ * targets only within its "current" session: when the id exists only in
+ * another session it silently returns the current session's active pane with
+ * exit code 0 (observed: `-t %39` -> `%2` of an unrelated session). send-keys
+ * then succeeds while typing into the WRONG pane, and the launch command is
+ * never executed. Detect the remap by echoing the target's own id back.
+ *
+ * Retried briefly: the pane registry may lag right after a split.
+ * Throws when the target persistently resolves to a different pane.
+ */
+export function verifyPaneTarget(surface: string): void {
+  requireTmux();
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const resolved = execFileSync(
+        "tmux",
+        ["display-message", "-p", "-t", surface, "#{pane_id}"],
+        { encoding: "utf8", timeout: 5_000 },
+      ).trim();
+      if (resolved === surface) return;
+      lastError = new Error(
+        `tmux target ${surface} resolves to ${resolved || "<empty>"} (cross-session pane remap?)`,
+      );
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+    if (attempt < 4) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300 * attempt);
+    }
+  }
+  throw lastError ?? new Error(`tmux target ${surface} could not be verified`);
+}
+
+/**
  * Send a command string to a pane and execute it.
  * Typed literally (`-l`) so special characters are not interpreted as keys,
  * then submitted with Enter.
  */
 export function sendCommand(surface: string, command: string): void {
   requireTmux();
+  // Guard against the psmux cross-session `%N` remap: never type into a pane
+  // whose identity we cannot confirm. A failed send must raise here, not
+  // silently strand the watcher waiting for a process that never started.
+  verifyPaneTarget(surface);
   execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
@@ -382,14 +421,75 @@ export async function pollForExit(
     interval: number;
     sessionFile?: string;
     sentinelFile?: string;
+    /**
+     * Sub-agent activity file (PI_SUBAGENT_ACTIVITY_FILE). Its creation is a
+     * sign of life: only a running child pi writes it. Used by the startup
+     * watchdog to confirm the launch command actually executed.
+     */
+    activityFile?: string;
+    /**
+     * Max time (ms) to wait for ANY sign that the launch command executed
+     * (activity file, launchlog, or a session file touched after start).
+     * Without it a lost send-keys (psmux `%N` cross-session remap, dropped
+     * input during shell init) strands the watcher forever. 0/undefined
+     * disables the watchdog.
+     */
+    startupDeadlineMs?: number;
+    /**
+     * Grace period (ms) after the pane becomes unreadable before declaring it
+     * gone. A destroyed pane without an exit marker is an error, not an
+     * infinite wait. Defaults to 30_000 when startupDeadlineMs is set.
+     */
+    paneGoneGraceMs?: number;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const startupDeadlineMs = options.startupDeadlineMs ?? 0;
+  const paneGoneGraceMs = options.paneGoneGraceMs ?? 30_000;
+  let started = false;
+  let paneGoneSince: number | null = null;
+
+  // A sign of life proves the launch script/pi actually ran in the pane.
+  // Session files in seeded modes are pre-created by the parent, so the file
+  // must have been TOUCHED after launch to count.
+  const hasSignOfLife = (): boolean => {
+    try {
+      if (options.activityFile && existsSync(options.activityFile)) return true;
+    } catch {}
+    try {
+      if (options.sessionFile) {
+        if (existsSync(`${options.sessionFile}.launchlog`)) return true;
+        if (existsSync(options.sessionFile) && statSync(options.sessionFile).mtimeMs >= start - 1000) {
+          return true;
+        }
+      }
+    } catch {}
+    return false;
+  };
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
+    }
+
+    // Startup watchdog: no sign of life past the deadline means the launch
+    // command never executed (lost/remapped send-keys). Fail loudly instead
+    // of parking the parent tree forever.
+    if (startupDeadlineMs > 0 && !started) {
+      if (hasSignOfLife()) {
+        started = true;
+      } else if (Date.now() - start > startupDeadlineMs) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage:
+            `launch_failed: no launcher, session, or activity activity within ` +
+            `${Math.round(startupDeadlineMs / 1000)}s — the launch command likely never ` +
+            `executed in pane ${surface} (lost or mis-targeted send-keys). ` +
+            `Do NOT steer this pane; spawn a fresh sub-agent instead.`,
+        };
+      }
     }
 
     // Fast path: check for .exit sidecar file (written by the error path)
@@ -416,6 +516,7 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
+      paneGoneSince = null;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
@@ -431,6 +532,19 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      // An unreadable/destroyed pane with no exit marker is a terminal
+      // failure, not a state worth waiting on forever.
+      if (paneGoneSince === null) {
+        paneGoneSince = Date.now();
+      } else if (Date.now() - paneGoneSince > paneGoneGraceMs) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage:
+            `Pane ${surface} has been unreadable for >${Math.round(paneGoneGraceMs / 1000)}s ` +
+            `without an exit marker — the sub-agent is gone without reporting. Treating as failed.`,
+        };
       }
     }
 

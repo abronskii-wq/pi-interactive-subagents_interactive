@@ -30,7 +30,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { shellEscape, pollForExit } from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -2513,6 +2513,100 @@ describe("subagent startup delay", () => {
     } finally {
       if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
       else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+    }
+  });
+});
+describe("subagent startup deadline", () => {
+  it("defaults to 120000ms when no env var is set", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.getStartupDeadlineMs, "function");
+
+    const original = process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+    delete process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+    try {
+      assert.equal(testApi.getStartupDeadlineMs(), 120_000);
+    } finally {
+      if (original == null) delete process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+      else process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = original;
+    }
+  });
+
+  it("uses PI_SUBAGENT_STARTUP_DEADLINE_MS when it is set", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const original = process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+    process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = "45000";
+    try {
+      assert.equal(testApi.getStartupDeadlineMs(), 45_000);
+    } finally {
+      if (original == null) delete process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS;
+      else process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS = original;
+    }
+  });
+});
+
+describe("pollForExit startup watchdog", () => {
+  it("fails with launch_failed when no sign of life appears before the deadline", async () => {
+    // No tmux needed: the unreadable pane only starts the pane-gone grace
+    // timer; the startup deadline must fire first and short-circuit.
+    const dir = mkdtempSync(join(tmpdir(), "poll-watchdog-"));
+    try {
+      const sessionFile = join(dir, "never-created.jsonl");
+      const activityFile = join(dir, "never-created.activity.json");
+      const result = await pollForExit("%definitely-not-a-pane", new AbortController().signal, {
+        interval: 50,
+        sessionFile,
+        activityFile,
+        startupDeadlineMs: 300,
+        paneGoneGraceMs: 60_000,
+      });
+      assert.equal(result.reason, "error");
+      assert.match(result.errorMessage ?? "", /launch_failed/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not fire when a sign of life exists (activity file created)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "poll-watchdog-alive-"));
+    try {
+      const sessionFile = join(dir, "session.jsonl");
+      const activityFile = join(dir, "activity.json");
+      writeFileSync(activityFile, "{}");
+      // Abort shortly after the first tick: the watchdog must not fire, the
+      // abort is what ends the wait.
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 400);
+      await assert.rejects(
+        pollForExit("%definitely-not-a-pane", controller.signal, {
+          interval: 50,
+          sessionFile,
+          activityFile,
+          startupDeadlineMs: 150,
+          paneGoneGraceMs: 60_000,
+        }),
+        /Aborted/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports pane-gone after the grace period once startup was confirmed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "poll-gone-"));
+    try {
+      const activityFile = join(dir, "activity.json");
+      writeFileSync(activityFile, "{}"); // confirms startup immediately
+      const result = await pollForExit("%definitely-not-a-pane", new AbortController().signal, {
+        interval: 50,
+        activityFile,
+        startupDeadlineMs: 30_000,
+        paneGoneGraceMs: 200,
+      });
+      assert.equal(result.reason, "error");
+      assert.match(result.errorMessage ?? "", /unreadable|gone|exit marker/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

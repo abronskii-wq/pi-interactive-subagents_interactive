@@ -550,6 +550,19 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+/**
+ * Max time to wait for any sign that a launched sub-agent actually started
+ * (activity file, launchlog, or a session file touched after launch). Without
+ * a deadline a lost/mis-targeted send-keys (e.g. the psmux cross-session `%N`
+ * remap) leaves the watcher waiting forever and parks the whole parent tree
+ * via runningChildrenCount>0. Default 120s; 0 disables the watchdog.
+ */
+function getStartupDeadlineMs(): number {
+  const raw = process.env.PI_SUBAGENT_STARTUP_DEADLINE_MS?.trim();
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 120_000;
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -1169,6 +1182,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
+  getStartupDeadlineMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1581,6 +1595,12 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      activityFile: running.activityFile,
+      // The startup watchdog relies on pi-side artifacts (activity file,
+      // launchlog, pi session JSONL). The claude CLI writes none of these, so
+      // the watchdog would false-positive there — pane-gone detection still
+      // applies to both paths.
+      startupDeadlineMs: running.cli === "claude" ? 0 : getStartupDeadlineMs(),
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1736,16 +1756,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
+        "The acknowledgement means the pane and job were REGISTERED — it does NOT prove the sub-agent process started. " +
+        "Startup failures are detected by a watchdog and reported to you as an error result (launch_failed). " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
+        "If no result (success OR error) arrives within a reasonable time, suspect a launch failure: tell the user instead of waiting forever, and spawn a FRESH sub-agent (new name) if the work is still needed — never reuse or message a sub-agent whose start was never confirmed. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
+        "Acknowledgement = job registered, NOT process started; a watchdog reports launch_failed if it never starts. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
+        "If no result arrives in a reasonable time, suspect launch failure: tell the user and spawn a FRESH sub-agent (new name) — never reuse or message an unconfirmed one. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       parameters: SubagentParams,
 
@@ -2064,11 +2089,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "`name` and `message` are both required. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
+        "SAFETY: never steer a sub-agent whose start was never confirmed (no result, no sign of life, or a reported launch_failed) — its pane may be a bare shell where your text would execute as a command. Spawn a fresh sub-agent instead. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion — the harness handles delivery. " +
         "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
       promptSnippet:
         "Message a subagent by name: steers it if running, resumes it if finished (same name either way). " +
         "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
+        "Never steer a sub-agent with an unconfirmed/failed launch — its pane may be a bare shell. Spawn fresh instead. " +
         "Do not poll or fabricate results.",
       parameters: Type.Object({
         name: Type.String({
