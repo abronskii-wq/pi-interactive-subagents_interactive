@@ -15,6 +15,7 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { applySubagentLayout } from "./pane-layout.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -99,35 +100,27 @@ export function shellEscape(s: string): string {
 
 // ── Pane layout ──
 
-/**
- * tmux layout applied to the subagent window to keep panes evenly sized.
- * Switchable: "even-horizontal" (equal columns), "main-vertical" (big main
- * pane + tiled column), "tiled" (grid: rows + columns).
- */
-const SUBAGENT_TMUX_LAYOUT = "tiled";
-
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Re-balance subagent panes so repeated splits don't leave them lopsided.
  * tmux halves the target pane on every split and dumps freed space onto a
- * neighbor on close, so without this panes drift to wildly uneven widths.
- * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. Debounced so a burst
- * of parallel spawns or staggered exits collapses into a single layout call,
- * and non-fatal: a cosmetic resize must never break spawning or watching.
+ * neighbor on close, so without this panes drift to wildly uneven sizes.
+ * Applies the pane layout policy (see pane-layout.ts) to the parent pi window.
+ * Debounced so a burst of parallel spawns or staggered exits collapses into a
+ * single layout call, and non-fatal: a cosmetic resize must never break
+ * spawning or watching.
  */
-function rebalanceSurfaces(hintPane?: string): void {
-  // Prefer the parent pi pane (stable; survives a closing subagent pane).
-  const target = process.env.TMUX_PANE ?? hintPane;
+function rebalanceSurfaces(parentPane?: string): void {
+  // Use an explicit parent when supplied; the process may be running inside a
+  // different psmux session. The parent survives subagent pane closure.
+  const target = parentPane ?? process.env.TMUX_PANE;
   if (!target) return;
   if (rebalanceTimer) clearTimeout(rebalanceTimer);
   rebalanceTimer = setTimeout(() => {
     rebalanceTimer = null;
     try {
-      // -t <pane> resolves to that pane's window; does not change focus.
-      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
-        encoding: "utf8",
-      });
+      applySubagentLayout(target);
     } catch {
       // Pane/window may be gone; balancing is best-effort.
     }
@@ -195,14 +188,11 @@ export function createSurfaceSplit(
   // Rebalance the target's window BEFORE splitting. psmux halves the target
   // pane on every split; a burst of parallel launches can shrink the parent
   // below MIN_SPLIT_COLS (21) so the next split fails silently and returns
-  // the target id. Equalising first widens the target so splits keep
-  // succeeding. Cosmetic on failure.
+  // the target id. Applying the layout policy first restores the parent to its
+  // policy size so splits keep succeeding. Cosmetic on failure.
   if (fromSurface) {
     try {
-      execFileSync("tmux", ["select-layout", "-t", fromSurface, SUBAGENT_TMUX_LAYOUT], {
-        encoding: "utf8",
-        timeout: 5_000,
-      });
+      applySubagentLayout(fromSurface);
     } catch {
       // best effort
     }
@@ -227,7 +217,7 @@ export function createSurfaceSplit(
           timeout: 10_000,
         });
         if (live.split(/\r?\n/).includes(pane)) {
-          rebalanceSurfaces(pane);
+          rebalanceSurfaces(fromSurface ?? process.env.TMUX_PANE);
           return pane;
         }
         lastError = new Error(`tmux split-window returned ${pane} but no such pane exists`);
@@ -368,12 +358,13 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 }
 
 /**
- * Close a pane.
+ * Close a pane and rebuild the surviving window by its current pane count.
+ * Pass a qualified parentPane when the pane belongs to another psmux session.
  */
-export function closeSurface(surface: string): void {
+export function closeSurface(surface: string, parentPane = process.env.TMUX_PANE): void {
   requireTmux();
   execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
-  rebalanceSurfaces();
+  rebalanceSurfaces(parentPane);
 }
 
 // ── Exit polling ──

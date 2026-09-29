@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+Pane layout follows [the 1–9-pane policy](pi-extension/subagents/PANE-LAYOUT-POLICY.md): the parent stays on the left, and subagents fill the right side and then the section below the parent. After spawns and exits, the extension re-applies the layout for the current pane count (exits are debounced); surviving agents may move. More than nine panes are still allowed and use tmux's `tiled` layout until the count drops back to nine or fewer. Layout sizes scale with the current window.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 

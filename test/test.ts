@@ -6,6 +6,15 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import {
+  buildLayoutString,
+  layoutChecksum,
+  policyShape,
+  splitEven,
+  PARENT_COLUMN_SHARE,
+  PARENT_SHARE_LARGE,
+  PARENT_SHARE_SMALL,
+} from "../pi-extension/subagents/pane-layout.ts";
 
 import {
   getLeafId,
@@ -2793,6 +2802,111 @@ describe("tmux.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+  });
+});
+
+describe("pane-layout policy", () => {
+  describe("splitEven", () => {
+    it("keeps the parts equal when the space divides evenly", () => {
+      assert.deepEqual(splitEven(47, 3), [15, 15, 15]);
+      assert.deepEqual(splitEven(99, 2), [49, 49]);
+      assert.deepEqual(splitEven(65, 2), [32, 32]);
+      assert.deepEqual(splitEven(47, 1), [47]);
+    });
+
+    it("accounts for the borders between parts", () => {
+      const parts = splitEven(47, 2);
+      assert.deepEqual(parts, [23, 23]);
+      assert.equal(parts.reduce((a, b) => a + b, 0) + (parts.length - 1), 47);
+    });
+
+    it("never returns a part below one cell", () => {
+      for (const n of [1, 2, 3, 5]) {
+        assert.ok(splitEven(3, n).every((v) => v >= 1), `n=${n}`);
+      };
+    });
+  });
+
+  describe("policyShape", () => {
+    it("keeps every agent in the right zone up to four", () => {
+      assert.deepEqual(policyShape(0), { under: 0, right: 0 });
+      assert.deepEqual(policyShape(1), { under: 0, right: 1 });
+      assert.deepEqual(policyShape(4), { under: 0, right: 4 });
+    });
+
+    it("moves overflow agents under the parent, then grows the right zone", () => {
+      assert.deepEqual(policyShape(5), { under: 1, right: 4 });
+      assert.deepEqual(policyShape(6), { under: 2, right: 4 });
+      assert.deepEqual(policyShape(7), { under: 2, right: 5 });
+      assert.deepEqual(policyShape(8), { under: 2, right: 6 });
+    });
+
+    it("is undefined above the documented maximum", () => {
+      assert.equal(policyShape(9), null);
+      assert.equal(policyShape(20), null);
+    });
+  });
+
+  describe("layoutChecksum", () => {
+    // Body captured from a live psmux layout; the checksum it carried was e5ac.
+    const goldenBody =
+      "165x47,0,0{65x47,0,0[65x37,0,0,2,65x9,0,38{32x9,0,38,24,32x9,33,38,23}]," +
+      "99x47,66,0{49x47,66,0[49x15,66,0,22,49x15,66,16,21,49x15,66,32,20]," +
+      "49x47,116,0[49x15,116,0,19,49x15,116,16,18,49x15,116,32,17]}}";
+
+    it("matches the checksum psmux itself computed", () => {
+      assert.equal(layoutChecksum(goldenBody).toString(16), "e5ac");
+    });
+  });
+
+  describe("buildLayoutString", () => {
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => `%${i + 2}`);
+
+    it("emits two leaves without a one-child container at two panes", () => {
+      const layout = buildLayoutString(165, 47, ids(2), 1)!;
+      assert.match(layout, /^[0-9a-f]{4},165x47,0,0\{99x47,0,0,2,65x47,100,0,3\}$/);
+    });
+
+    it("emits a checksum-prefixed body with a size prefix on every container", () => {
+      const layout = buildLayoutString(165, 47, ids(9), 8);
+      assert.ok(layout, "layout expected for 8 agents at 165x47");
+      const [sum, body] = layout!.split(/,(?=165x47)/);
+      assert.match(sum, /^[0-9a-f]{4}$/);
+      assert.equal(Number.parseInt(sum, 16), layoutChecksum(body));
+      assert.ok(body.startsWith("165x47,0,0{"));
+      // every container carries its own WxH,X,Y before the brace/bracket
+      for (const match of body.matchAll(/[{[](?=[^\d])/g)) {
+        const before = body.slice(Math.max(0, match.index! - 12), match.index!);
+        assert.match(before, /\d+x\d+,\d+,\d+$/, `container prefix missing before ${match[0]}`);
+      }
+      for (const id of ids(9)) assert.ok(body.includes(`,${id.slice(1)}`), `pane ${id} placed`);
+    });
+
+    it("places the parent pane first in the root container", () => {
+      const layout = buildLayoutString(165, 47, ids(5), 4)!;
+      assert.match(layout, /^[0-9a-f]{4},165x47,0,0\{66x47,0,0,2,/);
+      assert.equal(Math.round(165 * PARENT_SHARE_LARGE), 66);
+    });
+
+    it("uses the wider parent column while agents fit in one right column", () => {
+      assert.equal(Math.round(165 * PARENT_SHARE_SMALL), 99);
+      const layout = buildLayoutString(165, 47, ids(3), 2)!;
+      assert.match(layout, /165x47,0,0\{99x47,0,0,2,65x47,100,0\[/);
+    });
+
+    it("gives the parent column 0.79 of the height when a section sits below it", () => {
+      assert.equal(Math.round(47 * PARENT_COLUMN_SHARE), 37);
+      const layout = buildLayoutString(165, 47, ids(7), 6)!;
+      // left column: parent leaf 66x37, then the 2-pane section at y=38
+      assert.match(layout, /66x47,0,0\[66x37,0,0,2,66x9,0,38\{33x9,0,38,\d+,32x9,34,38,\d+\}\]/);
+    });
+
+    it("returns null outside the policy or below the geometry guard", () => {
+      assert.equal(buildLayoutString(165, 47, ids(1), 0), null); // no layout needed for a single pane
+      assert.equal(buildLayoutString(165, 47, ids(10), 9), null);
+      assert.equal(buildLayoutString(165, 47, ids(4), 2), null); // pane count mismatch
+      assert.equal(buildLayoutString(60, 20, ids(9), 8), null); // too small for the scheme
     });
   });
 });
